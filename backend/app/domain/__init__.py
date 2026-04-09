@@ -1,6 +1,3 @@
-# Domain layer exports
-# Students must implement these classes
-
 from .user import User
 from .order import Order, OrderItem, OrderStatus, OrderStatusChange
 from .exceptions import (
@@ -18,7 +15,7 @@ from .exceptions import (
 
 __all__ = [
     "User",
-    "Order",
+    "Order", 
     "OrderItem",
     "OrderStatus",
     "OrderStatusChange",
