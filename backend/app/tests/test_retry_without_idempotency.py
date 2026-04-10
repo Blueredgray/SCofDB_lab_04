@@ -1,105 +1,159 @@
 """
 LAB 04: Демонстрация проблемы retry без идемпотентности.
 
-Сценарий:
-1) Клиент отправил запрос на оплату.
-2) До получения ответа "сеть оборвалась" (моделируем повтором запроса).
-3) Клиент повторил запрос БЕЗ Idempotency-Key.
-4) В unsafe-режиме возможна двойная оплата.
+Тест показывает, что без Idempotency-Key повторный запрос на оплату
+в режиме 'unsafe' может привести к двойному списанию.
 """
 
-import pytest
 import asyncio
+import pytest
 import uuid
-import httpx
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy import text
+from httpx import AsyncClient, ASGITransport
 
-BASE_URL = "http://localhost:8082"
+from app.main import app
+from app.application.payment_service import PaymentService
+
+DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/marketplace"
 
 
-async def create_test_order() -> uuid.UUID:
-    """Создать тестового пользователя и заказ для теста."""
-    async with httpx.AsyncClient() as client:
-        # Создаем пользователя
-        user_resp = await client.post(
-            f"{BASE_URL}/api/users",
-            json={"email": f"test_{uuid.uuid4().hex[:8]}@example.com", "name": "Test User"}
-        )
-        user_id = user_resp.json()["id"]
+@pytest.fixture(scope="module")
+async def test_engine():
+    """Создать движок для тестов."""
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20
+    )
+    yield engine
+    await engine.dispose()
 
-        # Создаем заказ
-        order_resp = await client.post(
-            f"{BASE_URL}/api/orders",
-            json={"user_id": user_id}
-        )
-        return uuid.UUID(order_resp.json()["id"])
+
+@pytest.fixture
+async def db_session(test_engine):
+    """Создать сессию БД."""
+    async with AsyncSession(test_engine) as session:
+        yield session
+
+
+@pytest.fixture
+async def test_order(test_engine):
+    """Создать тестовый заказ со статусом 'created'."""
+    user_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+
+    async with AsyncSession(test_engine) as setup_session:
+        async with setup_session.begin():
+            # Создаём пользователя
+            await setup_session.execute(
+                text("""
+                    INSERT INTO users (id, email, name, created_at)
+                    VALUES (:user_id, :email, :name, NOW())
+                    ON CONFLICT (id) DO NOTHING
+                """),
+                {
+                    "user_id": user_id,
+                    "email": f"test_no_idem_{order_id}@example.com",
+                    "name": "Test User No Idempotency"
+                }
+            )
+
+            # Создаём заказ
+            await setup_session.execute(
+                text("""
+                    INSERT INTO orders (id, user_id, status, total_amount, created_at)
+                    VALUES (:order_id, :user_id, 'created', 100.00, NOW())
+                """),
+                {"order_id": order_id, "user_id": user_id}
+            )
+
+            # Записываем начальный статус
+            await setup_session.execute(
+                text("""
+                    INSERT INTO order_status_history (id, order_id, status, changed_at)
+                    VALUES (gen_random_uuid(), :order_id, 'created', NOW())
+                """),
+                {"order_id": order_id}
+            )
+
+    yield order_id
+
+    # Очистка после теста
+    async with AsyncSession(test_engine) as cleanup_session:
+        async with cleanup_session.begin():
+            await cleanup_session.execute(
+                text("DELETE FROM order_status_history WHERE order_id = :order_id"),
+                {"order_id": order_id}
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM orders WHERE id = :order_id"),
+                {"order_id": order_id}
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM users WHERE id = :user_id"),
+                {"user_id": user_id}
+            )
 
 
 @pytest.mark.asyncio
-async def test_retry_without_idempotency_can_double_pay():
+async def test_retry_without_idempotency_can_double_pay(db_session, test_order, test_engine):
     """
-    Демонстрация сценария без идемпотентности.
+    LAB 04: Демонстрация проблемы — без Idempotency-Key
+    повторный запрос в режиме unsafe приводит к двойной оплате.
 
-    Рекомендуемые шаги:
-    1) Создать заказ в статусе created.
-    2) Выполнить две параллельные попытки POST /api/payments/retry-demo
-       с mode='unsafe' и БЕЗ заголовка Idempotency-Key.
-    3) Проверить историю order_status_history:
-       - paid-событий больше 1 (или иная метрика двойного списания).
-    4) Вывести понятный отчёт в stdout.
+    Сценарий:
+    1) Создан заказ в статусе 'created'.
+    2) Два параллельных POST /api/payments/retry-demo (mode='unsafe')
+       БЕЗ заголовка Idempotency-Key.
+    3) Оба запроса проходят проверку статуса одновременно (race condition).
+    4) Ожидаем: в истории заказа 2 записи 'paid'.
     """
-    # 1) Создаем заказ
-    order_id = await create_test_order()
-    print(f"\n📝 Создан заказ: {order_id}")
+    order_id = test_order
 
-    # 2) Выполняем две параллельные попытки оплаты БЕЗ Idempotency-Key
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            client.post(
-                f"{BASE_URL}/api/payments/retry-demo",
-                json={"order_id": str(order_id), "mode": "unsafe"}
-            ),
-            client.post(
-                f"{BASE_URL}/api/payments/retry-demo",
-                json={"order_id": str(order_id), "mode": "unsafe"}
-            )
-        ]
+    async def payment_attempt(session_factory):
+        """Выполнение небезопасной оплаты через PaymentService напрямую."""
+        async with AsyncSession(session_factory) as session:
+            service = PaymentService(session)
+            try:
+                return await service.pay_order_unsafe(order_id)
+            except Exception as e:
+                return {"error": str(e)}
 
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+    # Запускаем две попытки параллельно
+    results = await asyncio.gather(
+        payment_attempt(test_engine),
+        payment_attempt(test_engine),
+        return_exceptions=True
+    )
 
-        print(f"📡 Попытка 1: статус {responses[0].status_code if not isinstance(responses[0], Exception) else 'ERROR'}")
-        if not isinstance(responses[0], Exception):
-            print(f"   Ответ: {responses[0].json()}")
+    # Даём время на завершение транзакций
+    await asyncio.sleep(0.3)
 
-        print(f"📡 Попытка 2: статус {responses[1].status_code if not isinstance(responses[1], Exception) else 'ERROR'}")
-        if not isinstance(responses[1], Exception):
-            print(f"   Ответ: {responses[1].json()}")
+    # Проверяем историю оплат
+    async with AsyncSession(test_engine) as check_session:
+        service = PaymentService(check_session)
+        history = await service.get_payment_history(order_id)
 
-    # 3) Проверяем историю оплат
-    async with httpx.AsyncClient() as client:
-        history_resp = await client.get(f"{BASE_URL}/api/payments/history/{order_id}")
-        history = history_resp.json()
+    # Без защиты: ожидаем двойную оплату (race condition)
+    assert len(history) >= 2, (
+        f"Ожидалась двойная оплата (>=2 записи paid), "
+        f"но получено {len(history)}. Race condition не обнаружен."
+    )
 
-        payment_count = history["payment_count"]
-        payments = history["payments"]
-
-        print(f"\n📊 ИСТОРИЯ ОПЛАТ:")
-        print(f"   Количество записей о платеже: {payment_count}")
-        for p in payments:
-            print(f"   - {p['id']} at {p['changed_at']}")
-
-        # 4) Анализ результатов
-        print(f"\n🔍 АНАЛИЗ:")
-        if payment_count > 1:
-            print(f"   ❌ ПРОБЛЕМА ОБНАРУЖЕНА: Заказ оплачен {payment_count} раз(а)!")
-            print(f"      Это демонстрирует двойную оплату при отсутствии идемпотентности.")
-            print(f"      Без заголовка Idempotency-Key каждый запрос обрабатывается как новый.")
+    print(f"\n[LAB 04] Результат БЕЗ идемпотентности:")
+    print(f"  Order ID: {order_id}")
+    print(f"  Количество paid-событий: {len(history)}")
+    print(f"  Результаты попыток:")
+    for i, r in enumerate(results, 1):
+        if isinstance(r, Exception):
+            print(f"    Попытка {i}: ОШИБКА - {type(r).__name__}: {r}")
         else:
-            print(f"   ⚠️  Ожидалось >1 платежей, но получено {payment_count}")
-            print(f"      (Возможно, сработал триггер предотвращения двойной оплаты)")
-
-        # Проверяем, что тест показывает проблему
-        assert True, "Тест завершен - проверьте stdout для анализа"
+            print(f"    Попытка {i}: {r}")
+    print(f"  ВЫВОД: Двойная оплата подтверждена!")
 
 
 if __name__ == "__main__":
-    asyncio.run(test_retry_without_idempotency_can_double_pay())
+    pytest.main([__file__, "-v", "-s"])

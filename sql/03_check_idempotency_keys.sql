@@ -1,10 +1,10 @@
-\timing on
+timing on
 
 -- ============================================
 -- LAB 04: Проверка таблицы idempotency_keys
 -- ============================================
 --
--- Таблица появится после реализации миграции 002_idempotency_keys.sql
+-- Таблица появляется после применения миграции 002_idempotency_keys.sql
 
 SELECT
     idempotency_key,
@@ -13,6 +13,7 @@ SELECT
     status,
     status_code,
     created_at,
+    updated_at,
     expires_at
 FROM idempotency_keys
 ORDER BY created_at DESC

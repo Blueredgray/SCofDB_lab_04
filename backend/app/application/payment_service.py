@@ -49,7 +49,7 @@ class PaymentService:
             # Имитация задержки (проверка баланса, платёжный шлюз...)
             await asyncio.sleep(0.2)
 
-            # ⚠️ ВСТАВЛЯЕМ ЗАПИСЬ ОБ ОПЛАТЕ НАПРЯМУЮ
+            # ВСТАВЛЯЕМ ЗАПИСЬ ОБ ОПЛАТЕ НАПРЯМУЮ
             # Это имитирует что произошло бы без правильной синхронизации
             await self.session.execute(
                 text("""
@@ -65,11 +65,11 @@ class PaymentService:
                 {"order_id": order_id}
             )
 
-            return {
-                "order_id": str(order_id),
-                "status": "paid",
-                "message": "Order paid successfully (unsafe)"
-            }
+        return {
+            "order_id": str(order_id),
+            "status": "paid",
+            "message": "Order paid successfully (unsafe)"
+        }
 
     async def pay_order_safe(self, order_id: uuid.UUID, barrier: asyncio.Barrier = None) -> dict:
         """Безопасная оплата - REPEATABLE READ + FOR UPDATE.
@@ -114,11 +114,11 @@ class PaymentService:
                 {"order_id": order_id}
             )
 
-            return {
-                "order_id": str(order_id),
-                "status": "paid",
-                "message": "Order paid successfully (safe)"
-            }
+        return {
+            "order_id": str(order_id),
+            "status": "paid",
+            "message": "Order paid successfully (safe)"
+        }
 
     async def get_payment_history(self, order_id: uuid.UUID) -> list[dict]:
         """Получить историю оплат заказа."""

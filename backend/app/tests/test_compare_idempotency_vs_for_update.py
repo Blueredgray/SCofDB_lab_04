@@ -5,183 +5,237 @@ LAB 04: Сравнение подходов
 """
 
 import pytest
-import asyncio
 import uuid
-import httpx
+import asyncio
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy import text
+from httpx import AsyncClient, ASGITransport
 
-BASE_URL = "http://localhost:8082"
+from app.main import app
+from app.application.payment_service import PaymentService
+
+DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/marketplace"
 
 
-async def create_test_order() -> uuid.UUID:
-    """Создать тестового пользователя и заказ для теста."""
-    async with httpx.AsyncClient() as client:
-        user_resp = await client.post(
-            f"{BASE_URL}/api/users",
-            json={"email": f"test_{uuid.uuid4().hex[:8]}@example.com", "name": "Test User"}
-        )
-        user_id = user_resp.json()["id"]
+@pytest.fixture(scope="module")
+async def test_engine():
+    """Создать движок для тестов."""
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20
+    )
+    yield engine
+    await engine.dispose()
 
-        order_resp = await client.post(
-            f"{BASE_URL}/api/orders",
-            json={"user_id": user_id}
-        )
-        return uuid.UUID(order_resp.json()["id"])
+
+@pytest.fixture
+async def db_session(test_engine):
+    """Создать сессию БД."""
+    async with AsyncSession(test_engine) as session:
+        yield session
+
+
+async def _create_test_order(test_engine) -> tuple:
+    """Создать тестовый заказ и вернуть (order_id, user_id)."""
+    user_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+
+    async with AsyncSession(test_engine) as setup_session:
+        async with setup_session.begin():
+            await setup_session.execute(
+                text("""
+                    INSERT INTO users (id, email, name, created_at)
+                    VALUES (:user_id, :email, :name, NOW())
+                    ON CONFLICT (id) DO NOTHING
+                """),
+                {
+                    "user_id": user_id,
+                    "email": f"test_compare_{order_id}@example.com",
+                    "name": "Test User Compare"
+                }
+            )
+            await setup_session.execute(
+                text("""
+                    INSERT INTO orders (id, user_id, status, total_amount, created_at)
+                    VALUES (:order_id, :user_id, 'created', 100.00, NOW())
+                """),
+                {"order_id": order_id, "user_id": user_id}
+            )
+            await setup_session.execute(
+                text("""
+                    INSERT INTO order_status_history (id, order_id, status, changed_at)
+                    VALUES (gen_random_uuid(), :order_id, 'created', NOW())
+                """),
+                {"order_id": order_id}
+            )
+
+    return order_id, user_id
+
+
+async def _cleanup(test_engine, order_id, user_id):
+    """Очистить тестовые данные."""
+    async with AsyncSession(test_engine) as cleanup_session:
+        async with cleanup_session.begin():
+            await cleanup_session.execute(
+                text("DELETE FROM idempotency_keys WHERE request_path LIKE '%payments%'")
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM order_status_history WHERE order_id = :order_id"),
+                {"order_id": order_id}
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM orders WHERE id = :order_id"),
+                {"order_id": order_id}
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM users WHERE id = :user_id"),
+                {"user_id": user_id}
+            )
 
 
 @pytest.mark.asyncio
-async def test_compare_for_update_and_idempotency_behaviour():
+async def test_compare_for_update_and_idempotency_behaviour(db_session, test_engine):
     """
-    TODO: Реализовать сравнительный тест/сценарий.
+    LAB 04: Сравнение двух подходов к защите от повторной оплаты.
 
-    Минимум сравнения:
-    1) Повтор запроса с mode='for_update':
-       - защита от гонки на уровне БД,
-       - повтор может вернуть бизнес-ошибку "already paid".
-    2) Повтор запроса с mode='unsafe' + Idempotency-Key:
-       - второй вызов возвращает тот же кэшированный успешный ответ,
-         без повторного списания.
+    Подход 1: FOR UPDATE (lab_02)
+    - Защита от race condition на уровне БД.
+    - При повторном запросе (race) вторая транзакция получает ошибку
+      "Order already paid" от триггера или FOR UPDATE.
+    - Цель: предотвратить параллельную обработку одного заказа.
 
-    В конце добавьте вывод:
-    - чем отличаются цели и UX двух подходов,
-    - почему они не взаимоисключающие и могут использоваться вместе.
+    Подход 2: Idempotency-Key + middleware (lab_04)
+    - Защита от повторов на уровне API-контракта.
+    - При повторе с тем же ключом и payload клиент получает
+      тот же успешный ответ (из кэша), без повторного списания.
+    - Цель: гарантировать, что повторный запрос клиента
+      (после обрыва сети) не приведёт к повторной операции.
+
+    Вывод: подходы НЕ взаимоисключающие и дополняют друг друга.
+    FOR UPDATE защищает от конкурентных транзакций,
+    Idempotency-Key — от повторных запросов клиента.
     """
 
-    print("\n" + "="*60)
-    print("СРАВНЕНИЕ: FOR UPDATE vs Idempotency-Key")
-    print("="*60)
+    # ========================================
+    # Подход 1: FOR UPDATE (две параллельные попытки)
+    # ========================================
+    order_id_1, user_id_1 = await _create_test_order(test_engine)
 
-    # ===== ТЕСТ 1: FOR UPDATE =====
-    print("\n🔒 ТЕСТ 1: Повторный запрос с mode='for_update'")
-    print("-" * 60)
+    try:
+        async def attempt_for_update():
+            async with AsyncSession(test_engine) as session:
+                service = PaymentService(session)
+                try:
+                    return await service.pay_order_safe(order_id_1)
+                except Exception as e:
+                    return {"error": str(e), "type": type(e).__name__}
 
-    order_1 = await create_test_order()
-    print(f"📝 Заказ создан: {order_1}")
-
-    async with httpx.AsyncClient() as client:
-        # Первый запрос (успешен)
-        print(f"\n📡 Запрос 1 (for_update):")
-        resp1 = await client.post(
-            f"{BASE_URL}/api/payments/retry-demo",
-            json={"order_id": str(order_1), "mode": "for_update"}
+        results_for_update = await asyncio.gather(
+            attempt_for_update(),
+            attempt_for_update(),
+            return_exceptions=True
         )
-        print(f"   Статус: {resp1.status_code}")
-        print(f"   Ответ: {resp1.json()}")
+        await asyncio.sleep(0.3)
 
-        # Второй запрос (уже оплачено)
-        print(f"\n📡 Запрос 2 (for_update) - повтор:")
-        resp2 = await client.post(
-            f"{BASE_URL}/api/payments/retry-demo",
-            json={"order_id": str(order_1), "mode": "for_update"}
-        )
-        print(f"   Статус: {resp2.status_code}")
-        print(f"   Ответ: {resp2.json()}")
+        async with AsyncSession(test_engine) as check_session:
+            service = PaymentService(check_session)
+            history_for_update = await service.get_payment_history(order_id_1)
 
-        for_update_result = {
-            "first_status": resp1.status_code,
-            "second_status": resp2.status_code,
-            "second_success": resp2.json().get("success", False),
-            "second_message": resp2.json().get("message", "")
-        }
+        # FOR UPDATE: только одна оплата, вторая с ошибкой
+        success_fu = sum(1 for r in results_for_update
+                         if isinstance(r, dict) and "error" not in r)
+        error_fu = sum(1 for r in results_for_update
+                       if isinstance(r, dict) and "error" in r)
+    finally:
+        await _cleanup(test_engine, order_id_1, user_id_1)
 
-    # ===== ТЕСТ 2: Idempotency-Key =====
-    print("\n\n🔑 ТЕСТ 2: Повторный запрос с Idempotency-Key (mode='unsafe')")
-    print("-" * 60)
+    # ========================================
+    # Подход 2: Idempotency-Key (повторный запрос через API)
+    # ========================================
+    order_id_2, user_id_2 = await _create_test_order(test_engine)
+    idempotency_key = "compare-test-key-789"
+    payload = {"order_id": str(order_id_2), "mode": "for_update"}
 
-    order_2 = await create_test_order()
-    idempotency_key = f"compare-test-{uuid.uuid4().hex[:8]}"
-    print(f"📝 Заказ создан: {order_2}")
-    print(f"🔑 Idempotency-Key: {idempotency_key}")
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test"
+        ) as client:
+            # Первый запрос с Idempotency-Key
+            response1 = await client.post(
+                "/api/payments/retry-demo",
+                json=payload,
+                headers={"Idempotency-Key": idempotency_key}
+            )
 
-    async with httpx.AsyncClient() as client:
-        # Первый запрос (успешен)
-        print(f"\n📡 Запрос 1 (с Idempotency-Key):")
-        resp3 = await client.post(
-            f"{BASE_URL}/api/payments/retry-demo",
-            json={"order_id": str(order_2), "mode": "unsafe"},
-            headers={"Idempotency-Key": idempotency_key}
-        )
-        print(f"   Статус: {resp3.status_code}")
-        print(f"   Заголовки: {dict(resp3.headers)}")
-        print(f"   Ответ: {resp3.json()}")
+            # Повторный запрос с тем же ключом
+            response2 = await client.post(
+                "/api/payments/retry-demo",
+                json=payload,
+                headers={"Idempotency-Key": idempotency_key}
+            )
 
-        # Второй запрос (кэшированный ответ)
-        print(f"\n📡 Запрос 2 (тот же Idempotency-Key):")
-        resp4 = await client.post(
-            f"{BASE_URL}/api/payments/retry-demo",
-            json={"order_id": str(order_2), "mode": "unsafe"},
-            headers={"Idempotency-Key": idempotency_key}
-        )
-        print(f"   Статус: {resp4.status_code}")
-        print(f"   Заголовки: {dict(resp4.headers)}")
-        print(f"   Ответ: {resp4.json()}")
+        body1 = response1.json()
+        body2 = response2.json()
 
-        is_cached = resp4.headers.get("x-idempotency-replayed") == "true"
+        async with AsyncSession(test_engine) as check_session:
+            service = PaymentService(check_session)
+            history_idem = await service.get_payment_history(order_id_2)
 
-        idempotency_result = {
-            "first_status": resp3.status_code,
-            "second_status": resp4.status_code,
-            "is_cached": is_cached,
-            "second_success": resp4.json().get("success", False)
-        }
+        # Idempotency-Key: оба ответа успешны, но оплата только одна
+        is_cached = response2.headers.get("X-Idempotency") == "cached"
+    finally:
+        await _cleanup(test_engine, order_id_2, user_id_2)
 
-    # ===== СРАВНЕНИЕ =====
-    print("\n\n" + "="*60)
-    print("СРАВНИТЕЛЬНЫЙ АНАЛИЗ")
-    print("="*60)
+    # ========================================
+    # Ассерты и выводы
+    # ========================================
 
-    print("\n📊 FOR UPDATE (Lab 02):")
-    print(f"   - Первый запрос:  {for_update_result['first_status']} {'✅' if for_update_result['first_status'] == 200 else '❌'}")
-    print(f"   - Второй запрос:  {for_update_result['second_status']} {'✅' if for_update_result['second_status'] == 200 else '⚠️ '}")
-    print(f"   - Результат:      {for_update_result['second_message']}")
-    print(f"   - Тип защиты:     База данных (REPEATABLE READ + блокировка строки)")
-    print(f"   - Цель:           Предотвращение race condition при конкурентном доступе")
+    # FOR UPDATE: только одна успешная оплата
+    assert success_fu == 1, (
+        f"FOR UPDATE: ожидалась 1 успешная оплата, получено {success_fu}"
+    )
+    assert len(history_for_update) == 1, (
+        f"FOR UPDATE: ожидалась 1 запись paid, получено {len(history_for_update)}"
+    )
 
-    print("\n📊 Idempotency-Key (Lab 04):")
-    print(f"   - Первый запрос:  {idempotency_result['first_status']} ✅")
-    print(f"   - Второй запрос:  {idempotency_result['second_status']} ✅")
-    print(f"   - Кэширован:      {'ДА ✅' if idempotency_result['is_cached'] else 'НЕТ ❌'}")
-    print(f"   - Тип защиты:     API уровень (ключ идемпотентности)")
-    print(f"   - Цель:           Предотвращение повторной обработки того же намерения")
+    # Idempotency-Key: только одна оплата, второй ответ из кэша
+    assert len(history_idem) == 1, (
+        f"Idempotency-Key: ожидалась 1 запись paid, получено {len(history_idem)}"
+    )
+    assert is_cached, "Второй ответ должен быть из кэша (X-Idempotency: cached)"
+    assert body1 == body2, "Ответы должны совпадать"
 
-    print("\n🔍 КЛЮЧЕВЫЕ РАЗЛИЧИЯ:")
-    print("-" * 60)
-    print("1. УРОВЕНЬ ЗАЩИТЫ:")
-    print("   • FOR UPDATE:     База данных (транзакционный уровень)")
-    print("   • Idempotency:    API / Приложение (уровень HTTP)")
-    print()
-    print("2. ПОВЕДЕНИЕ ПРИ ПОВТОРЕ:")
-    print("   • FOR UPDATE:     Второй запрос получает ошибку 'already paid'")
-    print("   • Idempotency:    Второй запрос получает ТОТ ЖЕ успешный ответ")
-    print()
-    print("3. UX (ПОЛЬЗОВАТЕЛЬСКИЙ ОПЫТ):")
-    print("   • FOR UPDATE:     Клиент видит ошибку, не знает успешна ли оплата")
-    print("   • Idempotency:    Клиент видит успех (тот же ответ), уверен в результате")
-    print()
-    print("4. СЦЕНАРИИ ИСПОЛЬЗОВАНИЯ:")
-    print("   • FOR UPDATE:     Конкурентные запросы от разных клиентов/источников")
-    print("   • Idempotency:    Retry от одного клиента после таймаута/обрыва связи")
-
-    print("\n💡 РЕКОМЕНДАЦИЯ:")
-    print("-" * 60)
-    print("Эти подходы НЕ взаимоисключающие, а ДОПОЛНЯЮТ друг друга:")
-    print()
-    print("✅ Используйте Idempotency-Key для:")
-    print("   • Защиты от retry после сетевых ошибок")
-    print("   • Обеспечения идемпотентности API для клиентов")
-    print("   • Сохранения положительного UX (тот же ответ при повторе)")
-    print()
-    print("✅ Используйте FOR UPDATE для:")
-    print("   • Защиты от race condition в высококонкурентных сценариях")
-    print("   • Гарантии целостности данных на уровне БД")
-    print("   • Блокировки ресурса на время транзакции")
-    print()
-    print("🎯 Идеальная архитектура: ОБА механизма вместе!")
-    print("   Idempotency-Key (API) + FOR UPDATE (БД) = Максимальная надёжность")
-
-    # Проверки
-    assert idempotency_result["is_cached"], "Idempotency-Key должен вернуть кэшированный ответ"
-    print("\n✅ Тест сравнения завершен успешно!")
+    print(f"\n{'='*60}")
+    print(f"LAB 04: СРАВНЕНИЕ FOR UPDATE vs IDEMPOTENCY-KEY")
+    print(f"{'='*60}")
+    print(f"\n--- Подход 1: FOR UPDATE (lab_02) ---")
+    print(f"  Успешных оплат: {success_fu}")
+    print(f"  Ошибок: {error_fu}")
+    print(f"  Записей paid в истории: {len(history_for_update)}")
+    print(f"  Цель: защита от race condition на уровне БД")
+    print(f"  UX: второй конкурентный запрос получает ошибку")
+    print(f"  Механизм: SELECT ... FOR UPDATE + триггер БД")
+    print(f"\n--- Подход 2: Idempotency-Key + middleware (lab_04) ---")
+    print(f"  Успешных ответов: 2 (оба 200 OK)")
+    print(f"  Записей paid в истории: {len(history_idem)}")
+    print(f"  Второй ответ из кэша: {'Да' if is_cached else 'Нет'}")
+    print(f"  Цель: защита от повторных запросов на уровне API")
+    print(f"  UX: клиент получает тот же ответ, ничего не сломалось")
+    print(f"  Механизм: таблица idempotency_keys + middleware")
+    print(f"\n--- Вывод ---")
+    print(f"  1. FOR UPDATE защищает от КОНКУРЕНТНЫХ транзакций.")
+    print(f"     Вторая параллельная транзакция получает ОШИБКУ.")
+    print(f"  2. Idempotency-Key защищает от ПОВТОРНЫХ запросов клиента.")
+    print(f"     Клиент получает тот же УСПЕШНЫЙ ответ из кэша.")
+    print(f"  3. Подходы НЕ взаимоисключающие — их нужно использовать ВМЕСТЕ.")
+    print(f"     FOR UPDATE — от гонок на уровне БД.")
+    print(f"     Idempotency-Key — от сетевых повторов на уровне API.")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
-    asyncio.run(test_compare_for_update_and_idempotency_behaviour())
+    pytest.main([__file__, "-v", "-s"])

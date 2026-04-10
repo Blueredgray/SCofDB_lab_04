@@ -1,11 +1,4 @@
-from .db import get_db, engine, SessionLocal, DATABASE_URL
+from .db import engine, SessionLocal, get_db
 from .repositories import UserRepository, OrderRepository
 
-__all__ = [
-    "get_db",
-    "engine",
-    "SessionLocal",
-    "DATABASE_URL",
-    "UserRepository",
-    "OrderRepository",
-]
+__all__ = ["engine", "SessionLocal", "get_db", "UserRepository", "OrderRepository"]

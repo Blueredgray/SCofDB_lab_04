@@ -49,6 +49,7 @@ class OrderStatusChange:
     status: OrderStatus
     changed_at: datetime
     id: uuid.UUID = field(default_factory=uuid.uuid4)
+    order_id: Optional[uuid.UUID] = None
 
 
 @dataclass

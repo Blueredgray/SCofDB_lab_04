@@ -65,7 +65,6 @@ RETURNS TRIGGER AS $$
 DECLARE
     skip_trigger text;
 BEGIN
-    -- Проверка переменной сессии для отключения триггера
     skip_trigger := current_setting('app.skip_log_trigger', true);
     IF skip_trigger = 'true' THEN
         RETURN NEW;

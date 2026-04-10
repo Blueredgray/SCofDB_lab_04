@@ -12,7 +12,7 @@ docker compose down -v
 docker compose up -d --build
 ```
 
-## 2) Реализовать миграцию idempotency_keys
+## 2) Миграция idempotency_keys
 Файл:
 - `backend/migrations/002_idempotency_keys.sql`
 
@@ -21,24 +21,18 @@ docker compose up -d --build
 docker compose exec -T db psql -U postgres -d marketplace -f /docker-entrypoint-initdb.d/002_idempotency_keys.sql
 ```
 
-## 3) Реализовать middleware
+## 3) Middleware
 Файл:
 - `backend/app/middleware/idempotency_middleware.py`
 
-Проверьте, что middleware подключен в `backend/app/main.py`.
+Middleware уже подключен в `backend/app/main.py`.
 
 ## 4) Подготовить заказ для ручной проверки (опционально)
 ```bash
 docker compose exec -T db psql -U postgres -d marketplace -f /sql/01_prepare_demo_order.sql
 ```
 
-## 5) Реализовать и запустить тесты
-Файлы:
-- `backend/app/tests/test_retry_without_idempotency.py`
-- `backend/app/tests/test_retry_with_idempotency_key.py`
-- `backend/app/tests/test_compare_idempotency_vs_for_update.py`
-
-Запуск:
+## 5) Запустить тесты
 ```bash
 docker compose exec -T backend pytest app/tests/test_retry_without_idempotency.py -v -s
 docker compose exec -T backend pytest app/tests/test_retry_with_idempotency_key.py -v -s
@@ -46,4 +40,4 @@ docker compose exec -T backend pytest app/tests/test_compare_idempotency_vs_for_
 ```
 
 ## 6) Заполнить отчёт
-Заполните `REPORT.md` по результатам сценариев и сравнений.
+Отчёт `REPORT.md` уже заполнен по результатам сценариев и сравнений.
