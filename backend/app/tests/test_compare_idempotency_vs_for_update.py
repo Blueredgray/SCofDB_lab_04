@@ -14,7 +14,12 @@ from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.application.payment_service import PaymentService
 
-DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/marketplace"
+import os
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@db:5432/marketplace"
+)
 
 
 @pytest.fixture(scope="module")
