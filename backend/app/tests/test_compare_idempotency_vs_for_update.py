@@ -6,13 +6,11 @@ LAB 04: Сравнение подходов
 
 import pytest
 import uuid
-import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy import text
 from httpx import AsyncClient, ASGITransport
 
 from app.main import app
-from app.application.payment_service import PaymentService
 
 import os
 
@@ -22,15 +20,15 @@ DATABASE_URL = os.environ.get(
 )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 async def test_engine():
-    """Создать движок для тестов."""
+    """Создать движок для тестов (function scope = один event loop)."""
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20
+        pool_pre_ping=False,
+        pool_size=5,
+        max_overflow=10
     )
     yield engine
     await engine.dispose()
@@ -125,35 +123,26 @@ async def test_compare_for_update_and_idempotency_behaviour(db_session, test_eng
     """
 
     # ========================================
-    # Подход 1: FOR UPDATE (две параллельные попытки)
+    # Подход 1: FOR UPDATE (через /api/payments/test-concurrent)
     # ========================================
     order_id_1, user_id_1 = await _create_test_order(test_engine)
 
     try:
-        async def attempt_for_update():
-            async with AsyncSession(test_engine) as session:
-                service = PaymentService(session)
-                try:
-                    return await service.pay_order_safe(order_id_1)
-                except Exception as e:
-                    return {"error": str(e), "type": type(e).__name__}
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test"
+        ) as client:
+            response_fu = await client.post(
+                "/api/payments/test-concurrent",
+                json={"order_id": str(order_id_1), "mode": "safe"}
+            )
 
-        results_for_update = await asyncio.gather(
-            attempt_for_update(),
-            attempt_for_update(),
-            return_exceptions=True
-        )
-        await asyncio.sleep(0.3)
-
-        async with AsyncSession(test_engine) as check_session:
-            service = PaymentService(check_session)
-            history_for_update = await service.get_payment_history(order_id_1)
-
-        # FOR UPDATE: только одна оплата, вторая с ошибкой
-        success_fu = sum(1 for r in results_for_update
-                         if isinstance(r, dict) and "error" not in r)
-        error_fu = sum(1 for r in results_for_update
-                       if isinstance(r, dict) and "error" in r)
+        assert response_fu.status_code == 200
+        body_fu = response_fu.json()
+        success_fu = body_fu["summary"]["successful"]
+        error_fu = body_fu["summary"]["failed"]
+        history_count_fu = body_fu["summary"]["payment_count_in_history"]
+        history_fu = body_fu["history"]
     finally:
         await _cleanup(test_engine, order_id_1, user_id_1)
 
@@ -186,9 +175,16 @@ async def test_compare_for_update_and_idempotency_behaviour(db_session, test_eng
         body1 = response1.json()
         body2 = response2.json()
 
-        async with AsyncSession(test_engine) as check_session:
-            service = PaymentService(check_session)
-            history_idem = await service.get_payment_history(order_id_2)
+        # Проверяем историю через API
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test"
+        ) as client:
+            history_resp = await client.get(
+                f"/api/payments/history/{order_id_2}"
+            )
+        history_idem_data = history_resp.json()
+        history_count_idem = history_idem_data["payment_count"]
 
         # Idempotency-Key: оба ответа успешны, но оплата только одна
         is_cached = response2.headers.get("X-Idempotency") == "cached"
@@ -203,13 +199,13 @@ async def test_compare_for_update_and_idempotency_behaviour(db_session, test_eng
     assert success_fu == 1, (
         f"FOR UPDATE: ожидалась 1 успешная оплата, получено {success_fu}"
     )
-    assert len(history_for_update) == 1, (
-        f"FOR UPDATE: ожидалась 1 запись paid, получено {len(history_for_update)}"
+    assert history_count_fu == 1, (
+        f"FOR UPDATE: ожидалась 1 запись paid, получено {history_count_fu}"
     )
 
     # Idempotency-Key: только одна оплата, второй ответ из кэша
-    assert len(history_idem) == 1, (
-        f"Idempotency-Key: ожидалась 1 запись paid, получено {len(history_idem)}"
+    assert history_count_idem == 1, (
+        f"Idempotency-Key: ожидалась 1 запись paid, получено {history_count_idem}"
     )
     assert is_cached, "Второй ответ должен быть из кэша (X-Idempotency: cached)"
     assert body1 == body2, "Ответы должны совпадать"
@@ -220,13 +216,13 @@ async def test_compare_for_update_and_idempotency_behaviour(db_session, test_eng
     print(f"\n--- Подход 1: FOR UPDATE (lab_02) ---")
     print(f"  Успешных оплат: {success_fu}")
     print(f"  Ошибок: {error_fu}")
-    print(f"  Записей paid в истории: {len(history_for_update)}")
+    print(f"  Записей paid в истории: {history_count_fu}")
     print(f"  Цель: защита от race condition на уровне БД")
     print(f"  UX: второй конкурентный запрос получает ошибку")
     print(f"  Механизм: SELECT ... FOR UPDATE + триггер БД")
     print(f"\n--- Подход 2: Idempotency-Key + middleware (lab_04) ---")
     print(f"  Успешных ответов: 2 (оба 200 OK)")
-    print(f"  Записей paid в истории: {len(history_idem)}")
+    print(f"  Записей paid в истории: {history_count_idem}")
     print(f"  Второй ответ из кэша: {'Да' if is_cached else 'Нет'}")
     print(f"  Цель: защита от повторных запросов на уровне API")
     print(f"  UX: клиент получает тот же ответ, ничего не сломалось")

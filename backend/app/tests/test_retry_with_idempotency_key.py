@@ -12,7 +12,6 @@ from sqlalchemy import text
 from httpx import AsyncClient, ASGITransport
 
 from app.main import app
-from app.application.payment_service import PaymentService
 
 import os
 
@@ -22,15 +21,15 @@ DATABASE_URL = os.environ.get(
 )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 async def test_engine():
-    """Создать движок для тестов."""
+    """Создать движок для тестов (function scope = один event loop)."""
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20
+        pool_pre_ping=False,
+        pool_size=5,
+        max_overflow=10
     )
     yield engine
     await engine.dispose()
@@ -124,52 +123,63 @@ async def test_retry_with_same_key_returns_cached_response(db_session, test_orde
     idempotency_key = "test-key-retry-123"
     payload = {"order_id": str(order_id), "mode": "for_update"}
 
-    # Первый запрос с Idempotency-Key
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test"
     ) as client:
+        # Первый запрос с Idempotency-Key
         response1 = await client.post(
             "/api/payments/retry-demo",
             json=payload,
             headers={"Idempotency-Key": idempotency_key}
         )
 
-    assert response1.status_code == 200, f"Первый запрос должен быть успешным, получен {response1.status_code}"
-    body1 = response1.json()
-    assert body1.get("success") is True, f"Первый запрос вернул ошибку: {body1.get('message')}"
+        assert response1.status_code == 200, (
+            f"Первый запрос должен быть успешным, получен {response1.status_code}"
+        )
+        body1 = response1.json()
+        assert body1.get("success") is True, (
+            f"Первый запрос вернул ошибку: {body1.get('message')}"
+        )
 
-    # Повторный запрос с тем же ключом
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test"
-    ) as client:
+        # Проверяем историю через API
+        history_resp1 = await client.get(
+            f"/api/payments/history/{order_id}"
+        )
+        history1 = history_resp1.json()
+        count_after_first = history1["payment_count"]
+
+        # Повторный запрос с тем же ключом
         response2 = await client.post(
             "/api/payments/retry-demo",
             json=payload,
             headers={"Idempotency-Key": idempotency_key}
         )
 
-    assert response2.status_code == 200, f"Повторный запрос должен быть 200, получен {response2.status_code}"
-    body2 = response2.json()
+        assert response2.status_code == 200, (
+            f"Повторный запрос должен быть 200, получен {response2.status_code}"
+        )
+        body2 = response2.json()
 
-    # Проверяем, что второй ответ из кэша
-    assert response2.headers.get("X-Idempotency") == "cached", (
-        "Второй ответ должен иметь заголовок X-Idempotency: cached"
-    )
+        # Проверяем, что второй ответ из кэша
+        assert response2.headers.get("X-Idempotency") == "cached", (
+            "Второй ответ должен иметь заголовок X-Idempotency: cached"
+        )
 
-    # Проверяем, что тела ответов совпадают
-    assert body1 == body2, "Тела ответов должны совпадать (кэшированный ответ)"
+        # Проверяем, что тела ответов совпадают
+        assert body1 == body2, "Тела ответов должны совпадать (кэшированный ответ)"
 
-    # Проверяем, что оплата произошла только один раз
-    async with AsyncSession(test_engine) as check_session:
-        service = PaymentService(check_session)
-        history = await service.get_payment_history(order_id)
+        # Проверяем, что оплата произошла только один раз
+        history_resp2 = await client.get(
+            f"/api/payments/history/{order_id}"
+        )
+        history2 = history_resp2.json()
+        count_after_second = history2["payment_count"]
 
-    assert len(history) == 1, (
-        f"Ожидалось 1 событие paid, но получено {len(history)}. "
-        f"Повторное списание не должно было произойти!"
-    )
+        assert count_after_second == 1, (
+            f"Ожидалось 1 событие paid, но получено {count_after_second}. "
+            f"Повторное списание не должно было произойти!"
+        )
 
     print(f"\n[LAB 04] Результат С идемпотентностью:")
     print(f"  Order ID: {order_id}")
@@ -177,7 +187,8 @@ async def test_retry_with_same_key_returns_cached_response(db_session, test_orde
     print(f"  Первый ответ: {body1}")
     print(f"  Второй ответ: {body2}")
     print(f"  X-Idempotency header: {response2.headers.get('X-Idempotency')}")
-    print(f"  Количество paid-событий: {len(history)}")
+    print(f"  Paid-событий после первого запроса: {count_after_first}")
+    print(f"  Paid-событий после второго запроса: {count_after_second}")
     print(f"  ВЫВОД: Идемпотентность работает! Повторное списание не произошло.")
 
 
@@ -199,40 +210,38 @@ async def test_same_key_different_payload_returns_conflict(db_session, test_orde
     # Другой payload — используем другой mode (или другой order_id)
     payload2 = {"order_id": str(order_id), "mode": "unsafe"}
 
-    # Первый запрос
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test"
     ) as client:
+        # Первый запрос
         response1 = await client.post(
             "/api/payments/retry-demo",
             json=payload1,
             headers={"Idempotency-Key": idempotency_key}
         )
 
-    assert response1.status_code == 200, f"Первый запрос должен быть успешным, получен {response1.status_code}"
+        assert response1.status_code == 200, (
+            f"Первый запрос должен быть успешным, получен {response1.status_code}"
+        )
 
-    # Второй запрос с тем же ключом, но другим payload
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test"
-    ) as client:
+        # Второй запрос с тем же ключом, но другим payload
         response2 = await client.post(
             "/api/payments/retry-demo",
             json=payload2,
             headers={"Idempotency-Key": idempotency_key}
         )
 
-    assert response2.status_code == 409, (
-        f"Ожидался 409 Conflict при reuse ключа с другим payload, "
-        f"получен {response2.status_code}: {response2.text}"
-    )
+        assert response2.status_code == 409, (
+            f"Ожидался 409 Conflict при reuse ключа с другим payload, "
+            f"получен {response2.status_code}: {response2.text}"
+        )
 
-    conflict_body = response2.json()
-    assert "detail" in conflict_body, "Ответ 409 должен содержать поле detail"
-    assert "Idempotency-Key" in conflict_body["detail"], (
-        "Сообщение об ошибке должно упоминать Idempotency-Key"
-    )
+        conflict_body = response2.json()
+        assert "detail" in conflict_body, "Ответ 409 должен содержать поле detail"
+        assert "Idempotency-Key" in conflict_body["detail"], (
+            "Сообщение об ошибке должно упоминать Idempotency-Key"
+        )
 
     print(f"\n[LAB 04] Негативный тест (конфликт payload):")
     print(f"  Order ID: {order_id}")

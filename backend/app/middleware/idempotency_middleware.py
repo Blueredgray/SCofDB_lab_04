@@ -187,8 +187,8 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         return response
 
     @staticmethod
-    def _iterate(data):
-        """Вспомогательный генератор для body_iterator."""
+    async def _iterate(data):
+        """Асинхронный вспомогательный генератор для body_iterator."""
         for chunk in data:
             yield chunk
 
