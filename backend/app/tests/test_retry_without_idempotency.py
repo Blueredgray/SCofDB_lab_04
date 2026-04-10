@@ -118,12 +118,15 @@ async def test_retry_without_idempotency_can_double_pay(db_session, test_order, 
     """
     order_id = test_order
 
+    #Barrier для синхронизации: обе транзакции начнут SELECT одновременно
+    barrier = asyncio.Barrier(2)
+
     async def payment_attempt(session_factory):
         """Выполнение небезопасной оплаты через PaymentService напрямую."""
         async with AsyncSession(session_factory) as session:
             service = PaymentService(session)
             try:
-                return await service.pay_order_unsafe(order_id)
+                return await service.pay_order_unsafe(order_id, barrier=barrier)
             except Exception as e:
                 return {"error": str(e)}
 
@@ -135,7 +138,7 @@ async def test_retry_without_idempotency_can_double_pay(db_session, test_order, 
     )
 
     # Даём время на завершение транзакций
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.5)
 
     # Проверяем историю оплат
     async with AsyncSession(test_engine) as check_session:

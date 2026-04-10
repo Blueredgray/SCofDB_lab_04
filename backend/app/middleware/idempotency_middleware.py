@@ -167,7 +167,7 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
                     UPDATE idempotency_keys
                     SET status = :status,
                         status_code = :code,
-                        response_body = :body::jsonb,
+                        response_body = CAST(:body AS jsonb),
                         updated_at = NOW()
                     WHERE idempotency_key = :key
                       AND request_method = :method
